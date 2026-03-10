@@ -156,6 +156,24 @@ pub fn get_kernel_start() -> u64 {
     layout::HIMEM_START
 }
 
+/// Returns the physical address offset and virtual address offset when KASLR is enabled.
+fn get_kernel_kaslr_offset(kernel_size: u64) -> (u64, u64) {
+    /// The virtual offset is randomly chosen from [16MB, 1GB).
+    const KASLR_MIN_OFFSET: u64 = 0x1000000;
+    const KASLR_MAX_OFFSET: u64 = 1 << 30;
+    /// Alignment requirement for KASLR offset (2MB)
+    const KASLR_ALIGNMENT: u64 = 2 << 20;
+
+    // Physical offset is currently not randomized, return 0
+    let physical_offset = 0;
+
+    // Calculate the number of possible slots (2MB aligned positions)
+    let slots = 1 + (KASLR_MAX_OFFSET - kernel_size - KASLR_MIN_OFFSET) / KASLR_ALIGNMENT;
+    let slot_index = u64::from(vmm_sys_util::rand::xor_pseudo_rng_u32()) % slots;
+
+    (physical_offset, slot_index * KASLR_ALIGNMENT)
+}
+
 /// Returns the memory address where the initrd could be loaded.
 pub fn initrd_load_addr(guest_mem: &GuestMemoryMmap, initrd_size: usize) -> Option<u64> {
     let first_region = guest_mem.find_region(GuestAddress::new(0))?;
@@ -233,6 +251,7 @@ pub fn configure_system_for_boot(
                 GuestAddress(CMDLINE_START),
                 cmdline_size,
                 initrd,
+                &boot_cmdline,
             )?;
         }
     }
@@ -345,8 +364,10 @@ fn configure_64bit_boot(
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
     initrd: &Option<InitrdConfig>,
+    boot_cmdline: &Cmdline,
 ) -> Result<(), ConfigurationError> {
     const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
+    const KERNEL_BOOT_FLAG_KASLR: u16 = 1 << 1;
     const KERNEL_HDR_MAGIC: u32 = 0x5372_6448;
     const KERNEL_LOADER_OTHER: u8 = 0xff;
     const KERNEL_MIN_ALIGNMENT_BYTES: u32 = 0x0100_0000; // Must be non-zero.
@@ -361,6 +382,9 @@ fn configure_64bit_boot(
 
     params.hdr.type_of_loader = KERNEL_LOADER_OTHER;
     params.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
+    if !boot_cmdline.find_option_bool("nokaslr") {
+        params.hdr.boot_flag |= KERNEL_BOOT_FLAG_KASLR;
+    }
     params.hdr.header = KERNEL_HDR_MAGIC;
     params.hdr.cmd_line_ptr = u32::try_from(cmdline_addr.raw_value()).unwrap();
     params.hdr.cmdline_size = u32::try_from(cmdline_size).unwrap();
@@ -432,12 +456,21 @@ fn add_e820_entry(
 pub fn load_kernel(
     kernel: &File,
     guest_memory: &GuestMemoryMmap,
+    boot_cmdline: &Cmdline,
 ) -> Result<EntryPoint, ConfigurationError> {
     // Need to clone the File because reading from it
     // mutates it.
     let mut kernel_file = kernel
         .try_clone()
         .map_err(|_| ConfigurationError::KernelFile)?;
+    let mut kernel_size = 0;
+    let mut virtual_offset: u64 = 0;
+
+    if !boot_cmdline.find_option_bool("nokaslr") {
+        kernel_size = Loader::get_load_size(&mut kernel_file)
+            .map_err(ConfigurationError::KernelLoader)?;
+        (_, virtual_offset) = get_kernel_kaslr_offset(kernel_size);
+    }
 
     let entry_addr = Loader::load(
         guest_memory,
@@ -449,7 +482,16 @@ pub fn load_kernel(
 
     let mut entry_point_addr: GuestAddress = entry_addr.kernel_load;
     let mut boot_prot: BootProtocol = BootProtocol::LinuxBoot;
-    if let PvhBootCapability::PvhEntryPresent(pvh_entry_addr) = entry_addr.pvh_boot_cap {
+    // When KASLR is enabled, use LinuxBoot protocol, as PVH entry doesn't support KASLR.
+    if virtual_offset != 0 {
+        Loader::relocate(
+            guest_memory,
+            &mut kernel_file,
+            GuestAddress(entry_addr.kernel_end - kernel_size),
+            virtual_offset)
+            .map_err(ConfigurationError::KernelLoader)?;
+
+    } else if let PvhBootCapability::PvhEntryPresent(pvh_entry_addr) = entry_addr.pvh_boot_cap {
         // Use the PVH kernel entry point to boot the guest
         entry_point_addr = pvh_entry_addr;
         boot_prot = BootProtocol::PvhBoot;
@@ -533,6 +575,7 @@ mod verification {
 
 #[cfg(test)]
 mod tests {
+    use linux_loader::cmdline;
     use linux_loader::loader::bootparam::boot_e820_entry;
 
     use super::*;
@@ -582,8 +625,9 @@ mod tests {
         let mem_size = mib_to_bytes(128);
         let gm = arch_mem(mem_size);
         let mut resource_allocator = ResourceAllocator::new();
+        let cmdline = Cmdline::new(128).unwrap();
         mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus).unwrap();
-        configure_64bit_boot(&gm, GuestAddress(0), 0, &None).unwrap();
+        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, &cmdline).unwrap();
         configure_pvh(&gm, GuestAddress(0), &None).unwrap();
 
         // Now assigning some memory that is equal to the start of the 32bit memory hole.
@@ -591,7 +635,7 @@ mod tests {
         let gm = arch_mem(mem_size);
         let mut resource_allocator = ResourceAllocator::new();
         mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus).unwrap();
-        configure_64bit_boot(&gm, GuestAddress(0), 0, &None).unwrap();
+        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, &cmdline).unwrap();
         configure_pvh(&gm, GuestAddress(0), &None).unwrap();
 
         // Now assigning some memory that falls after the 32bit memory hole.
@@ -599,7 +643,7 @@ mod tests {
         let gm = arch_mem(mem_size);
         let mut resource_allocator = ResourceAllocator::new();
         mptable::setup_mptable(&gm, &mut resource_allocator, no_vcpus).unwrap();
-        configure_64bit_boot(&gm, GuestAddress(0), 0, &None).unwrap();
+        configure_64bit_boot(&gm, GuestAddress(0), 0, &None, &cmdline).unwrap();
         configure_pvh(&gm, GuestAddress(0), &None).unwrap();
     }
 

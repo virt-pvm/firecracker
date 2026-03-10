@@ -199,7 +199,7 @@ pub fn build_microvm_for_boot(
 
     let vm = Arc::new(vm);
 
-    let entry_point = load_kernel(&boot_config.kernel_file, vm.guest_memory())?;
+    let entry_point = load_kernel(&boot_config.kernel_file, vm.guest_memory(), &boot_cmdline)?;
     let initrd = InitrdConfig::from_config(boot_config, vm.guest_memory())?;
 
     if vm_resources.pci_enabled {

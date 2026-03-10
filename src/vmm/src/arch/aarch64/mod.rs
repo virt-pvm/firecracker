@@ -182,6 +182,7 @@ fn get_fdt_addr(mem: &GuestMemoryMmap) -> u64 {
 pub fn load_kernel(
     kernel: &File,
     guest_memory: &GuestMemoryMmap,
+    _boot_cmdline: &Cmdline,
 ) -> Result<EntryPoint, ConfigurationError> {
     // Need to clone the File because reading from it
     // mutates it.
